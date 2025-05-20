@@ -13,8 +13,8 @@ import tempfile
 from datetime import datetime
 import pandas as pd
 
-# Load environment variables
-load_dotenv()
+# Set Groq API key
+os.environ["GROQ_API_KEY"] = "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" # Replace with your actual API key
 
 # Set page configuration
 st.set_page_config(layout="wide")
@@ -168,34 +168,42 @@ def process_document(uploaded_file):
 def parse_quotation_content(response):
     """Parse the LLM response to extract quotation details"""
     try:
-        # Split the response into lines and extract relevant information
         lines = response.split('\n')
         items = []
         current_item = {}
         
         for line in lines:
-            if 'Product:' in line or 'Item:' in line:
+            line = line.strip()
+            if not line:  # Skip empty lines
+                continue
+                
+            if 'Product:' in line:
                 if current_item:
                     items.append(current_item)
-                current_item = {'description': line.split(':', 1)[1].strip()}
-            elif 'Price:' in line or 'Cost:' in line:
+                product_name = line.split(':', 1)[1].strip()
+                current_item = {'description': product_name}
+            elif 'Description:' in line:
+                desc = line.split(':', 1)[1].strip()
+                if desc != "Product not found in catalog":
+                    current_item['description'] = desc
+            elif 'Price:' in line:
                 price_str = line.split(':', 1)[1].strip()
-                # Extract numeric value from price string, handle INR symbol and commas
                 price = ''.join(filter(lambda x: x.isdigit() or x == '.', price_str.replace(',', '')))
                 current_item['price'] = float(price) if price else 0
             elif 'Quantity:' in line:
                 qty_str = line.split(':', 1)[1].strip()
                 current_item['quantity'] = int(qty_str) if qty_str.isdigit() else 1
-            elif 'Description:' in line:
-                current_item['description'] = line.split(':', 1)[1].strip()
         
         if current_item:
             items.append(current_item)
             
+        # Filter out products not found in catalog
+        items = [item for item in items if item.get('description') != "Product not found in catalog"]
+        
         return items
-    except Exception:
-        # If parsing fails, return a simple structure
-        return [{'description': response, 'price': 0, 'quantity': 1}]
+    except Exception as e:
+        st.error(f"Error parsing quotation: {str(e)}")
+        return []
 
 def generate_quotation(content):
     pdf = QuotationPDF()
@@ -203,6 +211,10 @@ def generate_quotation(content):
     pdf.create_table_header()
     
     items = parse_quotation_content(content)
+    if not items:
+        st.error("No valid products found for quotation")
+        return None
+        
     total_amount = 0
     
     pdf.set_font('Arial', '', 10)
@@ -282,40 +294,75 @@ def main():
                         st.info(content)
 
             # Initialize conversation chain with combined vector stores
-            template = """Based on the provided context from multiple documents, please answer the following question. 
-            When generating a quotation, use ONLY the products and prices mentioned in the context.
-            All prices should be in Indian Rupees (INR).
+            template = """You are a precise and accurate assistant that answers questions based on the provided documents. Your task is to provide exact information from the context.
 
             Context: {context}
             Question: {question}
 
-            If generating a quotation, format your response STRICTLY as follows for each item:
+            IMPORTANT RULES:
+            1. ONLY use information that is explicitly stated in the context
+            2. DO NOT make assumptions or inferences
+            3. If the exact information is not in the context, respond with "Information not found in the documents"
+            4. Keep responses concise and to the point
+            5. For product questions:
+               - List only products that exactly match the query
+               - Include exact prices and specifications as stated in the documents
+               - Do not include similar or related products unless specifically asked
+            6. For numerical questions:
+               - Provide exact numbers from the context
+               - Do not round or approximate
+            7. Format responses in a clear, bullet-point style
+            8. If the question is ambiguous, ask for clarification
+
+            For quotation requests, format your response EXACTLY as follows for each requested product:
             Product: [Exact Product Name from Context]
-            Description: [Product Description from Context]
-            Price: [Price in INR]
+            Description: [Exact Product Description from Context]
+            Price: [Exact Price in INR from Context]
             Quantity: [Requested Quantity]
 
-            Make sure to:
-            1. Only include products that exist in the context
-            2. Use exact prices from the context
-            3. Format prices in INR
-            4. Include all relevant product details
+            Example responses:
 
-            For non-quotation queries, provide a normal response.
+            For quotation request "Quote for 2 laptops and 3 monitors":
+            Product: Laptop Model X
+            Description: 15.6" Laptop with 8GB RAM
+            Price: 45000
+            Quantity: 2
+
+            Product: Monitor Model Y
+            Description: 24" LED Monitor
+            Price: 12000
+            Quantity: 3
+
+            For general question "What is the price of Laptop X?":
+            • Price: Rs. 45,000 (as per document)
+
+            For "List all laptops under 50,000":
+            • Laptop Model X
+              - Price: Rs. 45,000
+              - Specifications: 15.6" display, 8GB RAM
+            • Laptop Model Y
+              - Price: Rs. 48,000
+              - Specifications: 14" display, 16GB RAM
+
+            For unavailable information:
+            "Information not found in the documents"
+
+            For ambiguous questions:
+            "Please specify which product/feature you are interested in"
             """
-            
+
             prompt = ChatPromptTemplate.from_template(template)
             
             llm = ChatGroq(
                 model_name="allam-2-7b",
-                temperature=0.3,
+                temperature=0.1,  # Lower temperature for more precise responses
                 max_tokens=4096
             )
             
             # Combine all vector stores for retrieval
             combined_retriever = None
             if st.session_state.vector_stores:
-                retrievers = [vs.as_retriever(search_kwargs={"k": 3}) 
+                retrievers = [vs.as_retriever(search_kwargs={"k": 5}) 
                             for vs in st.session_state.vector_stores.values()]
                 # Merge results from all retrievers
                 def combined_retrieve(query):
@@ -327,7 +374,15 @@ def main():
                 combined_retriever = combined_retrieve
             
             if combined_retriever:
-                st.session_state.conversation = (
+                # Create separate chains for quotations and general queries
+                st.session_state.quotation_chain = (
+                    {"context": combined_retriever, "question": RunnablePassthrough()}
+                    | prompt
+                    | llm
+                    | StrOutputParser()
+                )
+                
+                st.session_state.general_chain = (
                     {"context": combined_retriever, "question": RunnablePassthrough()}
                     | prompt
                     | llm
@@ -336,14 +391,18 @@ def main():
 
     with col2:
         st.markdown("### 💬 Chat Interface")
-        if hasattr(st.session_state, 'conversation') and st.session_state.conversation is not None:
+        if hasattr(st.session_state, 'quotation_chain') and hasattr(st.session_state, 'general_chain'):
             user_query = st.text_input("Ask about products or request a quotation:", key="query")
             
             if user_query:
                 with st.spinner("Generating response..."):
-                    response = st.session_state.conversation.invoke(user_query)
+                    # Determine if the query is for a quotation
+                    is_quotation = any(keyword in user_query.lower() for keyword in ['quote', 'quotation', 'price'])
                     
-                    if any(keyword in user_query.lower() for keyword in ['quote', 'quotation', 'price']):
+                    # Use appropriate chain based on query type
+                    response = st.session_state.quotation_chain.invoke(user_query) if is_quotation else st.session_state.general_chain.invoke(user_query)
+                    
+                    if is_quotation:
                         st.markdown("### 📊 Quotation Details")
                         st.write(response)
                         
