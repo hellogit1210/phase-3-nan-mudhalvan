@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_community.vectorstores import Chroma
 from langchain_core.output_parsers import StrOutputParser
@@ -13,8 +14,8 @@ import tempfile
 from datetime import datetime
 import pandas as pd
 
-# Set Groq API key
-os.environ["GROQ_API_KEY"] = "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" # Replace with your actual API key
+# Load environment variables
+load_dotenv()
 
 # Set page configuration
 st.set_page_config(layout="wide")
@@ -54,8 +55,8 @@ if 'uploaded_files' not in st.session_state:
     st.session_state.uploaded_files = []
 
 class QuotationPDF(FPDF):
-    def _init_(self):
-        super()._init_()
+    def init(self):
+        super().init()
         self.set_auto_page_break(auto=True, margin=15)
 
     def header(self):
@@ -420,4 +421,4 @@ def main():
                         st.write(response)
 
 if __name__ == "__main__":
-    main()
+    main()
